@@ -142,9 +142,10 @@ class Renderer:
                   GAPS[i] if i < len(GAPS) else GAPS[-1]]
         return np.concatenate(b[:-1])
 
-    def render_one(self, text, meter, seed=60, no_sandhi=True, speed=None, sps=None):
+    def render_one(self, text, meter, seed=60, no_sandhi=True, speed=None, sps=None, return_timestamps=False):
         """Synthesize one shloka. text = free Devanagari (split into padas on newline/danda).
-        Returns (sr, audio float32). Pipeline is identical to render_core.Renderer.render_one()."""
+        Returns (sr, audio float32), or (sr, audio, pada_timestamps) with return_timestamps=True.
+        Pipeline is identical to render_core.Renderer.render_one()."""
         padas = text if isinstance(text, list) else split_padas(text)
         if not padas:
             raise ValueError("empty text")
@@ -204,7 +205,19 @@ class Renderer:
         _slp = PT.align_slp1(padas[0])
         fric = bool(_slp) and _slp[0] in ("S", "z", "s", "h")
         halant = _ends_halant(PIECES[-1])
-        return SR, self._stitch(bseg, GAPS, fric=fric, halant=halant)
+        out = self._stitch(bseg, GAPS, fric=fric, halant=halant)
+        if not return_timestamps:
+            return SR, out
+        # pāda start/end in the stitched audio (same gate + gap arithmetic as _stitch)
+        ts, t_cur, last = [], 0.0, len(bseg) - 1
+        for i, s in enumerate(bseg):
+            dur = len(gate(s, fric=(fric and i == 0), halant=(halant and i == last))) / SR
+            ts.append({"pada_idx": i, "text": padas[i] if i < len(padas) else PIECES[i],
+                       "start": round(t_cur, 2), "end": round(t_cur + dur, 2)})
+            t_cur += dur
+            if i < last:
+                t_cur += len(GAPS[i]) / SR
+        return SR, out, ts
 
 
 def _cross_fade(waves: list[np.ndarray], dur_s: float = CROSS_FADE_S) -> np.ndarray:

@@ -4,7 +4,8 @@
 Pure-stdlib, in-memory (resets on process restart — fine for a public demo)."""
 import threading, datetime
 
-DAILY_LIMIT  = 10    # renders per IP per day
+import os
+DAILY_LIMIT  = int(os.environ.get("DAILY_LIMIT", "1000"))    # renders per IP per day (1000 for local use)
 MAX_AKSHARAS = 100   # one verse: longest common vṛtta (sragdharā) is 84 syllables; >100 = multiple shlokas
 
 _lock = threading.Lock()
@@ -12,7 +13,12 @@ _counts = {}  # ip -> [date_iso, count]
 
 
 def _n_aksharas(s):
-    """Count Devanagari/Kannada akṣaras (independent vowels + non-virāma-killed consonants)."""
+    """Count akṣaras across any Indian script (Devanagari, Kannada, Telugu, Malayalam, etc.)."""
+    try:
+        import prep_text as PT
+        s = PT.to_deva(s or "")
+    except Exception:
+        s = s or ""
     n = 0; L = len(s)
     for i, c in enumerate(s):
         o = ord(c)
@@ -40,13 +46,15 @@ def client_ip(request):
         return "unknown"
 
 
-def validate_one_shloka(text):
-    """Return an error message if the input is not a single shloka, else None."""
-    t = (text or "").replace("।।", "॥")
-    if t.count("॥") >= 2:
-        return "Please enter just one shloka at a time 🙏"
-    if _n_aksharas(text) > MAX_AKSHARAS:
-        return "That looks longer than one shloka — please paste a single verse 🙏"
+def validate_composition(text, max_shlokas=50):
+    """Validate a shloka or multi-verse composition for synthesis."""
+    if not text or not text.strip():
+        return "Please paste or upload a Sanskrit verse 🙏"
+    num_ak = _n_aksharas(text)
+    if num_ak == 0:
+        return "No chantable Sanskrit syllables found. Please ensure text is in Devanagari or another Indian script 🙏"
+    if num_ak > 4200:
+        return f"Input is very large ({num_ak} syllables). Please process up to ~50 shlokas at a time to prevent timeouts 🙏"
     return None
 
 

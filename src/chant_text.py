@@ -21,6 +21,10 @@ FALLBACK_METER = "vasantatilaka"
 
 # ── helpers (verbatim from render.py) ───────────────────────────────────────────────
 def n_aksharas(s):
+    try:
+        s = PT.to_deva(s or "")
+    except Exception:
+        s = s or ""
     n = 0; L = len(s)
     for i, c in enumerate(s):
         o = ord(c)
@@ -164,12 +168,127 @@ def _ends_halant(txt):
 _DANDAS = "।॥|"
 def split_padas(text):
     """Split a free-text shloka into hemistich/pada pieces: newlines first, then dandas. Empty drop."""
+    t = re.sub(r"॥\s*[\d\u0966-\u096F\.\-]+\s*॥", "।", text or "")
     pieces = []
-    for line in text.replace("॥", "।").replace("|", "।").splitlines():
+    for line in t.replace("॥", "।").replace("|", "।").splitlines():
         for seg in line.split("।"):
-            seg = seg.strip()
-            if seg: pieces.append(seg)
-    return pieces or ([text.strip()] if text.strip() else [])
+            cleaned = re.sub(r"[\d\u0966-\u096F\(\)\[\]\.\-]+", "", seg).strip()
+            if cleaned and n_aksharas(cleaned) > 0:
+                pieces.append(cleaned)
+    return pieces or ([text.strip()] if text and text.strip() and n_aksharas(text) > 0 else [])
+
+
+# Words that mark a line as a title ("कुलदेवता स्तोत्रम्") or an invocation rather than a verse.
+_TITLE_WORDS = ("स्तोत्र", "स्तोत्रं", "स्तुति", "स्तुतिः", "अष्टक", "कवच", "नामावलि", "नामावली",
+                "सहस्रनाम", "सुप्रभात", "पञ्चक", "पंचक", "दशक", "चालीसा", "मङ्गल", "मंगल", "शतक",
+                "हृदय", "गीता", "प्रार्थना", "वन्दना", "वंदना", "आरती", "ध्यानम्", "ध्यान",
+                "stotra", "stotram", "stuti", "ashtak", "aṣṭak", "astak", "kavach", "namavali",
+                "nāmāvali", "sahasranam", "suprabhat", "panchak", "dashak", "chalisa", "mangal",
+                "shatak", "hrudaya", "hridaya", "prarthana", "vandana", "aarti", "arati", "dhyanam")
+_DIGITS = re.compile(r"[\d०-९೦-೯౦-౯]")
+_MAX_HEADING_AKSHARAS = 22  # longer than any title; shorter than a full verse line of most metres
+
+
+def _strip_dandas(line):
+    return re.sub(r"^[\s।॥|]+|[\s।॥|]+$", "", line)
+
+
+def _is_heading_line(line, followed_by_blank):
+    """A short, non-verse line: wrapped in ॥…॥ with no verse number, followed by a blank line, or
+    containing a title word (stotram, aṣṭakam, kavacam …). Akṣaras are counted in any Indic script."""
+    core = _strip_dandas(line)
+    if not core or _DIGITS.search(core):
+        return False
+    if re.search(r"[A-Za-z]", core):  # romanised title
+        if len(core.split()) > 6:
+            return False
+    elif not (0 < n_aksharas(core) <= _MAX_HEADING_AKSHARAS):
+        return False
+    try:
+        deva = PT.to_deva(core)
+    except Exception:
+        deva = core
+    low = (deva + " " + core).lower()
+    wrapped = bool(re.match(r"^\s*(॥|\|\|)", line)) and bool(re.search(r"(॥|\|\|)\s*$", line))
+    titled = any(w in low for w in _TITLE_WORDS)
+    return wrapped or titled or followed_by_blank
+
+
+def _is_colophon_line(line):
+    """The closing line of a stotra: "॥ इति श्री … सम्पूर्णम् ॥"."""
+    core = _strip_dandas(line)
+    try:
+        deva = PT.to_deva(core)
+    except Exception:
+        deva = core
+    low = (deva + " " + core).lower()
+    return (deva.startswith("इति") or low.startswith("iti ")) and n_aksharas(core) <= 40
+
+
+def split_heading(text):
+    """Separate a stotra's title (and closing colophon) from its verses.
+
+    Returns (heading, body, colophon): heading/colophon are display strings ('' when absent) that are
+    NOT chanted, and body is the chantable text. Only leading lines (at most two) can be a heading,
+    and only when real verse text follows, so a plain single verse is never mistaken for a title."""
+    raw = (text or "").strip("\n")
+    lines = raw.split("\n")
+    i, heads = 0, []
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    while i < len(lines) and len(heads) < 2:
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        nxt_blank = (i + 1 < len(lines)) and not lines[i + 1].strip()
+        if not _is_heading_line(line, nxt_blank):
+            break
+        heads.append(_strip_dandas(line))
+        i += 1
+    body_lines = lines[i:]
+    colophon = ""
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+    if body_lines and _is_colophon_line(body_lines[-1]):
+        colophon = _strip_dandas(body_lines.pop())
+    body = "\n".join(body_lines).strip()
+    if not heads and not colophon:
+        return "", (text or "").strip(), ""
+    if n_aksharas(body) < 8:  # nothing left to chant: it was all verse after all
+        return "", (text or "").strip(), ""
+    return " · ".join(heads), body, colophon
+
+
+def split_shlokas(text):
+    """Split free text or multi-verse file into individual shlokas. A title line ("॥ कुलदेवता
+    स्तोत्रम् ॥") and a closing "इति … सम्पूर्णम्" line are left out — see split_heading."""
+    text = split_heading(text)[1]
+    if not text:
+        return []
+
+    # Method 1: Check for explicit verse number patterns: ॥ १ ॥, ॥ 1 ॥, ॥ १.१ ॥, || 1 ||
+    verse_num_pattern = r"(?:॥|\|\|)\s*[\d\u0966-\u096F\.\-]+\s*(?:॥|\|\|)"
+    if re.search(verse_num_pattern, text):
+        parts = re.split(verse_num_pattern, text)
+        res = [p.strip() for p in parts if p.strip() and n_aksharas(p) > 0]
+        if res:
+            return res
+
+    # Method 2: Paragraph breaks (blank lines between verses)
+    if "\n\n" in text:
+        parts = re.split(r"\n\s*\n+", text)
+        res = [p.strip() for p in parts if p.strip() and n_aksharas(p) > 0]
+        if len(res) > 1:
+            return res
+
+    # Method 3: If multiple '॥' and sufficient length (>= 32 aksharas total)
+    if text.count("॥") > 1:
+        parts = [p.strip() for p in text.split("॥") if p.strip() and n_aksharas(p) > 0]
+        if len(parts) > 1 and all(n_aksharas(p) >= 16 for p in parts):
+            return parts
+
+    return [text]
 
 
 def detect_meter_key(text):

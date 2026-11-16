@@ -14,3 +14,12 @@ demo/BigVGAN/
 !src/reference_bank/*.wav
 models/mlx/
 .convert-venv/
+
+# local runtime / personal files
+._*
+models/
+out/
+server.log
+.claude/
+.agents/
+training/namana/

@@ -10,7 +10,16 @@ Usage:
     r = Renderer(voice_path, voc_path, bank_path, device="cuda")
     sr, audio = r.render_one("तस्मै नमः ...", meter="anuṣṭubh")
 """
-import os, sys, glob, json, re, numpy as np, torch
+import os, sys, glob, json, re, numpy as np, torch, torchaudio
+import soundfile as sf
+
+def _sf_load(uri, **kwargs):
+    data, sr = sf.read(uri, dtype="float32")
+    t = torch.from_numpy(data)
+    if t.ndim == 1: t = t.unsqueeze(0)
+    else: t = t.t()
+    return t, sr
+torchaudio.load = _sf_load
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -26,7 +35,7 @@ FALLBACK_METER = "vasantatilaka"
 # Text helpers live in chant_text.py (shared with the MLX backend); re-exported here.
 from chant_text import (  # noqa: E402,F401
     n_aksharas, _aksharas, _rep_depths, _danda_fix, _anusvara_m, _satva, _visarga_ksha,
-    _hna_metathesis, _vocalic_l, gate, _ends_halant, split_padas, detect_meter_key,
+    _hna_metathesis, _vocalic_l, gate, _ends_halant, split_padas, split_shlokas, detect_meter_key,
     _VMATRA, _VECHO_SHORT, _VLONG, _AN_KA, _AN_CA, _AN_TTA, _AN_TA, _SATVA, _KSHA, _VIRAMA, _DANDAS,
 )
 
@@ -34,11 +43,13 @@ from chant_text import (  # noqa: E402,F401
 class Renderer:
     """Loads DiT + vocos + BigVGAN + the reference bank ONCE; render_one() synthesizes a single input."""
 
-    def __init__(self, voice_path, voc_path, bank_path, device="cuda", vocab_file=None,
-                 speed=0.90, nfe=64, cfg=3.0, gap=0.55, gap_halant=0.20):
+    def __init__(self, voice_path, voc_path, bank_path, device=None, vocab_file=None,
+                 speed=0.90, nfe=32, cfg=3.0, gap=0.55, gap_halant=0.20):
         import bigvgan
         from f5_tts.infer.utils_infer import load_model, load_vocoder, preprocess_ref_audio_text
         from f5_tts.model import DiT
+        if device is None or (device == "cuda" and not torch.cuda.is_available()):
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.device = device
         self.speed = speed; self.nfe = nfe; self.cfg = cfg
         self.gap = gap; self.gap_halant = gap_halant
@@ -121,7 +132,8 @@ class Renderer:
                   GAPS[i] if i < len(GAPS) else GAPS[-1]]
         return np.concatenate(b[:-1])
 
-    def render_one(self, text, meter, seed=60, no_sandhi=True, speed=None, sps=None):
+    def render_one(self, text, meter, seed=60, no_sandhi=True, speed=None, sps=None, return_timestamps=False,
+                   line_cb=None):
         """Synthesize one shloka. text = free Devanagari (split into padas on newline/danda).
         Returns (sr, audio float32). Pipeline is identical to render.py's render_clip()."""
         padas = text if isinstance(text, list) else split_padas(text)
@@ -138,6 +150,13 @@ class Renderer:
         PIECES = [_danda_fix(_visarga_ksha(_anusvara_m(x))) for x in PIECES]
         PIECES = [_hna_metathesis(x) for x in PIECES]
         PIECES = [_vocalic_l(x) for x in PIECES]
+
+        valid = [(p_orig, p_proc) for p_orig, p_proc in zip(padas, PIECES)
+                 if n_aksharas(p_proc) > 0 and p_proc.strip()]
+        if not valid:
+            raise ValueError("No chantable Sanskrit syllables found in input text")
+        padas = [v[0] for v in valid]
+        PIECES = [v[1] for v in valid]
 
         _ra, _rt = ref_audio, ref_t
         _mono = max((_rep_depths(_aksharas(x))[0] for x in PIECES), default=1)
@@ -161,7 +180,11 @@ class Renderer:
                          dtype=np.float32) for _p in PIECES]
         from f5_tts.infer.utils_infer import infer_process
         bseg = []
+        print(f"[vagdhenu] Starting synthesis of {len(PIECES)} line(s) (meter: {meter})...", flush=True)
         for i, p in enumerate(PIECES):
+            if line_cb:
+                line_cb(i, len(PIECES))
+            print(f"[vagdhenu] Chanting line {i+1}/{len(PIECES)} ({NSYLL[i]} aksharas, nfe={self.nfe})...", flush=True)
             au = None
             for att in range(4):
                 torch.manual_seed(seed + att)
@@ -173,6 +196,7 @@ class Renderer:
                 if np.abs(w).max() > 1.5: w = w/32768.0
                 if float(np.sqrt((w**2).mean())) > 0.04: au = w; break
             if au is None: au = w
+            print(f"[vagdhenu] Running BigVGAN vocoder on line {i+1}...", flush=True)
             y = self._bvgan(self.cap.last); mx = np.abs(y).max(); y = y/mx*0.97 if mx > 1 else y
             bseg.append(y)
 
@@ -180,4 +204,92 @@ class Renderer:
         fric = bool(_slp) and _slp[0] in ("S", "z", "s", "h")
         halant = _ends_halant(PIECES[-1])
         final = self._stitch(bseg, GAPS, fric=fric, halant=halant)
+        print(f"[vagdhenu] Synthesis complete! Total duration: {len(final)/SR:.2f}s", flush=True)
+
+        pada_timestamps = []
+        t_cur = 0.0
+        for i, s in enumerate(bseg):
+            p_audio = gate(s, fric=(fric and i == 0), halant=(halant and i == len(bseg) - 1))
+            dur = len(p_audio) / SR
+            t_start = t_cur
+            t_end = t_cur + dur
+            pada_text = padas[i] if i < len(padas) else PIECES[i]
+            pada_timestamps.append({
+                "pada_idx": i,
+                "text": pada_text,
+                "start": round(t_start, 2),
+                "end": round(t_end, 2)
+            })
+            t_cur = t_end
+            if i < len(bseg) - 1 and i < len(GAPS):
+                t_cur += len(GAPS[i]) / SR
+
+        if return_timestamps:
+            return SR, final, pada_timestamps
         return SR, final
+
+    def render_composition(self, text, meter=None, seed=60, progress_cb=None):
+        """Synthesize a complete file or composition containing 1 or more shlokas.
+        Splits text into shlokas, chants each shloka (parsing each into padas),
+        and stitches them together with an inter-shloka pause (1.2s).
+        Returns (SR, final_audio_float32, list_of_meter_names, all_timestamps).
+        """
+        shlokas = split_shlokas(text)
+        if not shlokas:
+            raise ValueError("No chantable Sanskrit syllables found in input")
+
+        shloka_waves = []
+        used_meters = []
+        all_timestamps = []
+        shloka_offset = 0.0
+        total = len(shlokas)
+        print(f"[vagdhenu] Processing composition with {total} shloka(s)...", flush=True)
+
+        for s_idx, shloka in enumerate(shlokas):
+            m = meter
+            if not m or m == "__auto__":
+                det = detect_meter_key(shloka)
+                m = det if (det and det.lower() in self._lut) else FALLBACK_METER
+            used_meters.append(m)
+
+            if progress_cb:
+                progress_cb(s_idx / total, f"Chanting shloka {s_idx+1}/{total} (meter: {m})...")
+            print(f"\n[vagdhenu] === Shloka {s_idx+1}/{total} (meter: {m}) ===", flush=True)
+
+            def _line_cb(i, n, s_idx=s_idx, m=m):
+                if progress_cb:
+                    progress_cb((s_idx + i / max(n, 1)) / total,
+                                f"Verse {s_idx+1}/{total} · line {i+1}/{n} · {m}")
+
+            sr, wave, p_timestamps = self.render_one(shloka, m, seed=seed + s_idx, return_timestamps=True,
+                                                     line_cb=_line_cb)
+            shloka_waves.append(wave)
+
+            for pt in p_timestamps:
+                all_timestamps.append({
+                    "shloka_idx": s_idx + 1,
+                    "pada_idx": pt["pada_idx"] + 1,
+                    "text": pt["text"],
+                    "start": round(shloka_offset + pt["start"], 2),
+                    "end": round(shloka_offset + pt["end"], 2),
+                    "meter": m
+                })
+
+            shloka_offset += (len(wave) / SR) + 1.2
+
+        if progress_cb:
+            progress_cb(1.0, "Stitching final audio composition...")
+
+        if len(shloka_waves) == 1:
+            final_audio = shloka_waves[0]
+        else:
+            inter_gap = np.zeros(int(1.2 * SR), dtype=np.float32)
+            stitched = []
+            for i, w in enumerate(shloka_waves):
+                stitched.append(w)
+                if i < len(shloka_waves) - 1:
+                    stitched.append(inter_gap)
+            final_audio = np.concatenate(stitched)
+
+        print(f"[vagdhenu] Composition complete! Total stitched duration: {len(final_audio)/SR:.2f}s across {total} shloka(s).", flush=True)
+        return SR, final_audio, used_meters, all_timestamps
